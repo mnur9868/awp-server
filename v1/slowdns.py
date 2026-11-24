@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+import asyncio
+import base64
+from collections import deque
+import struct
+import subprocess
+import time
+from typing import Awaitable, Callable, Deque, Dict, List, Optional, Tuple
+
+from config import (
+    DNS_BASE_RTO,
+    DNS_LEGACY_DOWNLINK_CHUNK,
+    DNS_MAX_DOWNLINK_CHUNK,
+    DNS_MAX_INFLIGHT,
+    DNS_MAX_UPLINK_CHUNK,
+    EDNS0_LEGACY_PAYLOAD_SIZE,
+    EDNS0_UDP_PAYLOAD_SIZE,
+    FLAG_DNS_CARRIER,
+    PROTOCOL_BANNER,
+    TYPE_DNS_BATCH,
+    TYPE_DNS_POLL,
+    TYPE_STREAM_DATA,
+)
+from crypto import AWPv3Crypto
+
+
+# =====================================================================
+# SLOWDNS ENGINE: DNS RFC 1035/6891 CODEC, AIMD QPS PACER & SACK ARQ
+# =====================================================================
+class DnsCodec:
+    """Encoder/decoder paket wire DNS TXT (RFC 1035 & EDNS0 RFC 6891)."""
+
+    @staticmethod
+    def skip_dns_name(data: bytes, pos: int) -> Optional[int]:
+        hops = 0
+        while pos < len(data):
+            ln = data[pos]
+            if ln == 0:
+                return pos + 1
+            if (ln & 0xC0) == 0xC0:
+                return pos + 2 if pos + 1 < len(data) else None
+            pos += 1 + ln
+            hops += 1
+            if hops > 64:
+                return None
+        return None
+
+    @staticmethod
+    def max_dns_uplink_arq_bytes(zone_labels: List[str]) -> int:
+        zone_wire_len = sum(1 + len(z) for z in zone_labels) + 1
+        avail_qname = max(62, 250 - zone_wire_len)
+        full_labels = avail_qname // 61
+        rem = avail_qname % 61
+        max_b32 = (full_labels * 60) + max(0, rem - 1)
+        max_raw_wire = (max_b32 * 5) // 8
+        # 49B = AWP v4.6 stateless crypto envelope
+        return max(48, max_raw_wire - 49)
+
+    @staticmethod
+    def detect_system_dns_resolvers() -> List[str]:
+        found: List[str] = []
+        try:
+            for prop in ("net.dns1", "net.dns2"):
+                out = (
+                    subprocess.check_output(
+                        ["getprop", prop], stderr=subprocess.DEVNULL, timeout=1.5
+                    )
+                    .decode()
+                    .strip()
+                )
+                if out and "." in out and not out.startswith("127.") and out not in found:
+                    found.append(out)
+        except Exception:
+            pass
+
+        for path in (
+            "/etc/resolv.conf",
+            "/data/data/com.termux/files/usr/etc/resolv.conf",
+        ):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.strip().split()
+                        if len(parts) >= 2 and parts[0] == "nameserver":
+                            ip = parts[1]
+                            if "." in ip and not ip.startswith("127.") and ip not in found:
+                                found.append(ip)
+            except Exception:
+                pass
+
+        return found if found else ["8.8.8.8", "1.1.1.1"]
+
+    @staticmethod
+    def build_dns_txt_query(
+        tx_id: int,
+        wire_bytes: bytes,
+        zone_labels: List[str],
+        edns_udp_size: int = EDNS0_LEGACY_PAYLOAD_SIZE,
+    ) -> bytes:
+        b32_str = base64.b32encode(wire_bytes).decode("ascii").rstrip("=").lower()
+        qname = bytearray()
+        for i in range(0, len(b32_str), 60):
+            lbl = b32_str[i : i + 60].encode("ascii")
+            qname.append(len(lbl))
+            qname.extend(lbl)
+        for zlbl in zone_labels:
+            zb = zlbl.encode("ascii")
+            qname.append(len(zb))
+            qname.extend(zb)
+        qname.append(0)
+
+        header = struct.pack("!HHHHHH", tx_id, 0x0100, 1, 0, 0, 1)
+        question = bytes(qname) + struct.pack("!HH", 16, 1)
+        adv_size = max(
+            EDNS0_LEGACY_PAYLOAD_SIZE, min(EDNS0_UDP_PAYLOAD_SIZE, edns_udp_size)
+        )
+        opt_rr = b"\x00" + struct.pack("!HHIH", 41, adv_size, 0, 0)
+        return header + question + opt_rr
+
+    @classmethod
+    def parse_dns_query(
+        cls, data: bytes
+    ) -> Optional[Tuple[int, List[str], bytes, int, int, int]]:
+        if len(data) < 17:
+            return None
+        tx_id, flags, qdcount, ancount, nscount, arcount = struct.unpack(
+            "!HHHHHH", data[:12]
+        )
+        if (flags & 0x8000) != 0 or qdcount < 1:
+            return None
+
+        idx = 12
+        labels: List[str] = []
+        jumped = False
+        end_idx = idx
+        hops = 0
+
+        while idx < len(data):
+            length = data[idx]
+            if length == 0:
+                if not jumped:
+                    end_idx = idx + 1
+                break
+            if (length & 0xC0) == 0xC0:
+                if idx + 1 >= len(data):
+                    return None
+                if not jumped:
+                    end_idx = idx + 2
+                idx = ((length & 0x3F) << 8) | data[idx + 1]
+                jumped = True
+                hops += 1
+                if hops > 10:
+                    return None
+                continue
+            idx += 1
+            if idx + length > len(data):
+                return None
+            labels.append(data[idx : idx + length].decode("ascii", errors="ignore"))
+            idx += length
+            if not jumped:
+                end_idx = idx
+
+        if end_idx + 4 > len(data):
+            return None
+        qtype, qclass = struct.unpack("!HH", data[end_idx : end_idx + 4])
+        question_wire = data[12 : end_idx + 4]
+
+        edns_udp_size = 0
+        scan_pos = end_idx + 4
+        for _ in range(qdcount - 1):
+            nxt = cls.skip_dns_name(data, scan_pos)
+            if nxt is None or nxt + 4 > len(data):
+                scan_pos = len(data)
+                break
+            scan_pos = nxt + 4
+
+        for _ in range(ancount + nscount):
+            nxt = cls.skip_dns_name(data, scan_pos)
+            if nxt is None or nxt + 10 > len(data):
+                scan_pos = len(data)
+                break
+            _, _, _, rdlen = struct.unpack("!HHIH", data[nxt : nxt + 10])
+            scan_pos = nxt + 10 + rdlen
+
+        for _ in range(arcount):
+            nxt = cls.skip_dns_name(data, scan_pos)
+            if nxt is None or nxt + 10 > len(data):
+                break
+            rtype, rclass, _, rdlen = struct.unpack("!HHIH", data[nxt : nxt + 10])
+            if rtype == 41:
+                edns_udp_size = max(512, min(EDNS0_UDP_PAYLOAD_SIZE, rclass))
+                break
+            scan_pos = nxt + 10 + rdlen
+
+        return tx_id, labels, question_wire, qtype, qclass, edns_udp_size
+
+    @staticmethod
+    def build_dns_txt_response(
+        tx_id: int,
+        question_wire: bytes,
+        payload_bytes: bytes,
+        has_more: bool,
+        backlog_hint: int = 0,
+        edns_udp_size: int = EDNS0_LEGACY_PAYLOAD_SIZE,
+    ) -> bytes:
+        flags_byte = 0x01 if has_more else 0x00
+        hint_byte = max(0, min(255, backlog_hint))
+        control_blob = bytes([flags_byte, hint_byte]) + payload_bytes
+        b64_ascii = base64.b64encode(control_blob)
+
+        rdata = bytearray()
+        for i in range(0, len(b64_ascii), 250):
+            chunk = b64_ascii[i : i + 250]
+            rdata.append(len(chunk))
+            rdata.extend(chunk)
+
+        use_edns = edns_udp_size > 512
+        arcount = 1 if use_edns else 0
+        header = struct.pack("!HHHHHH", tx_id, 0x8400, 1, 1, 0, arcount)
+        answer_rr = struct.pack("!HHHLH", 0xC00C, 16, 1, 0, len(rdata)) + bytes(rdata)
+        if use_edns:
+            opt_rr = b"\x00" + struct.pack(
+                "!HHIH", 41, min(EDNS0_UDP_PAYLOAD_SIZE, edns_udp_size), 0, 0
+            )
+            return header + question_wire + answer_rr + opt_rr
+        return header + question_wire + answer_rr
+
+    @classmethod
+    def response_has_edns_opt(cls, data: bytes) -> bool:
+        if len(data) < 12:
+            return False
+        _, _, qdcount, ancount, nscount, arcount = struct.unpack("!HHHHHH", data[:12])
+        if arcount < 1:
+            return False
+        idx = 12
+        for _ in range(qdcount):
+            nxt = cls.skip_dns_name(data, idx)
+            if nxt is None or nxt + 4 > len(data):
+                return False
+            idx = nxt + 4
+        for _ in range(ancount + nscount):
+            nxt = cls.skip_dns_name(data, idx)
+            if nxt is None or nxt + 10 > len(data):
+                return False
+            _, _, _, rdlen = struct.unpack("!HHIH", data[nxt : nxt + 10])
+            idx = nxt + 10 + rdlen
+        for _ in range(arcount):
+            nxt = cls.skip_dns_name(data, idx)
+            if nxt is None or nxt + 10 > len(data):
+                return False
+            rtype, _, _, rdlen = struct.unpack("!HHIH", data[nxt : nxt + 10])
+            if rtype == 41:
+                return True
+            idx = nxt + 10 + rdlen
+        return False
+
+    @classmethod
+    def parse_dns_txt_response(
+        cls, data: bytes, expected_tx_id: int
+    ) -> Optional[Tuple[bool, int, bytes]]:
+        if len(data) < 12:
+            return None
+        tx_id, flags, qdcount, ancount, _, _ = struct.unpack("!HHHHHH", data[:12])
+        if tx_id != expected_tx_id or (flags & 0x8000) == 0 or ancount < 1:
+            return None
+        idx = 12
+        for _ in range(qdcount):
+            nxt = cls.skip_dns_name(data, idx)
+            if nxt is None or nxt + 4 > len(data):
+                return None
+            idx = nxt + 4
+
+        b64_buf = bytearray()
+        for _ in range(ancount):
+            nxt = cls.skip_dns_name(data, idx)
+            if nxt is None or nxt + 10 > len(data):
+                return None
+            rtype, _, _, rdlen = struct.unpack("!HHIH", data[nxt : nxt + 10])
+            rdata_start = nxt + 10
+            rdata_end = rdata_start + rdlen
+            if rdata_end > len(data):
+                return None
+            if rtype == 16:
+                pos = rdata_start
+                while pos < rdata_end:
+                    slen = data[pos]
+                    pos += 1
+                    if pos + slen > rdata_end:
+                        break
+                    b64_buf.extend(data[pos : pos + slen])
+                    pos += slen
+            idx = rdata_end
+
+        if not b64_buf:
+            return None
+        try:
+            decoded = base64.b64decode(bytes(b64_buf))
+        except Exception:
+            return None
+        if len(decoded) < 2:
+            return None
+        has_more = (decoded[0] & 0x01) != 0
+        backlog_hint = decoded[1]
+        return has_more, backlog_hint, decoded[2:]
+
+
+class AdaptiveGlobalQpsPacer:
+    """Rate-limiter gabungan berbasis AIMD agar tidak memicu rate-limit proksi DNS operator."""
+
+    def __init__(self, base_qps: float = 32.0, max_qps: float = 48.0):
+        self.base_qps = max(8.0, min(120.0, float(base_qps)))
+        self.max_qps = max(self.base_qps, min(150.0, float(max_qps)))
+        self.current_qps = self.base_qps
+        self.next_slot = time.monotonic()
+        self.last_penalty_ts = 0.0
+
+    async def acquire(self):
+        interval = 1.0 / max(8.0, self.current_qps)
+        now = time.monotonic()
+        if now >= self.next_slot:
+            self.next_slot = now + interval
+            return
+        wait_time = self.next_slot - now
+        if wait_time > 1.2:
+            self.next_slot = now + interval
+            return
+        self.next_slot += interval
+        await asyncio.sleep(wait_time)
+
+    def on_success(self, rtt_ms: float):
+        if rtt_ms < 850.0 and self.current_qps < self.max_qps:
+            self.current_qps = min(self.max_qps, self.current_qps + 0.15)
+
+    def on_loss(self):
+        now = time.monotonic()
+        if (now - self.last_penalty_ts) >= 0.6:
+            self.last_penalty_ts = now
+            self.current_qps = max(24.0, self.current_qps * 0.94)
+
+
+class DnsArqEngine:
+    """
+    Mesin 64-bit Selective-ACK, Multi-Segment Coalescing, Exponential RTO & Dynamic Re-Slicing.
+    Format Wire ARQ:
+      [ack_seq:4B][sack_mask:8B][min_valid:4B][cap_code:1B] (17B)
+      + 0..N sub-segmen: [dns_seq:4B][ftype:1B][sid:2B][data_len:2B][data...] (9B + data)
+    """
+
+    ARQ_HDR_STRUCT = "!IQIB"
+    ARQ_HDR_SIZE = 17
+    SUB_HDR_STRUCT = "!IBHH"
+    SUB_HDR_SIZE = 9
+
+    def __init__(
+        self,
+        crypto: AWPv3Crypto,
+        is_server: bool,
+        initial_edns: int = EDNS0_LEGACY_PAYLOAD_SIZE,
+        max_inflight: int = DNS_MAX_INFLIGHT,
+        uplink_chunk: int = DNS_MAX_UPLINK_CHUNK,
+        base_rto: float = DNS_BASE_RTO,
+    ):
+        self.crypto = crypto
+        self.is_server = is_server
+        self.edns_size = initial_edns
+        self.client_chunk_cap = (
+            DNS_LEGACY_DOWNLINK_CHUNK
+            if initial_edns <= EDNS0_LEGACY_PAYLOAD_SIZE
+            else DNS_MAX_DOWNLINK_CHUNK
+        )
+        self.max_inflight = max_inflight
+        self.uplink_chunk = uplink_chunk
+        self.base_rto = base_rto
+
+        # Jacobson/Karels SRTT & RTTVAR
+        self.srtt: float = 0.45
+        self.rttvar: float = 0.15
+
+        self.rx_lock = asyncio.Lock()
+        self.tx_seq: int = 0
+        self.stream_queues: Dict[int, Deque[Tuple[int, bytes]]] = {}
+        self.stream_rr: Deque[int] = deque()
+        # unacked[seq] = [last_sent_ts, ftype, sid, chunk_bytes, retry_count]
+        self.unacked: Dict[int, list] = {}
+        self.rx_next_seq: int = 1
+        self.rx_ooo: Dict[int, Tuple[int, int, bytes]] = {}
+        self.retransmit_count: int = 0
+        self.coalesced_packets: int = 0
+        self.unacked_rx_ticks: int = 0
+
+    def update_rtt_ms(self, rtt_ms: float):
+        sample = max(0.05, min(3.5, rtt_ms / 1000.0))
+        err = abs(sample - self.srtt)
+        self.rttvar = (0.75 * self.rttvar) + (0.25 * err)
+        self.srtt = (0.875 * self.srtt) + (0.125 * sample)
+
+    def current_rto(self) -> float:
+        est = (2.2 * self.srtt) + (4.0 * self.rttvar)
+        return max(self.base_rto, min(3.8, est))
+
+    def downlink_chunk_limit(self) -> int:
+        edns_cap = (
+            DNS_MAX_DOWNLINK_CHUNK
+            if self.edns_size > EDNS0_LEGACY_PAYLOAD_SIZE
+            else DNS_LEGACY_DOWNLINK_CHUNK
+        )
+        return min(edns_cap, self.client_chunk_cap)
+
+    def tx_chunk_limit(self) -> int:
+        return self.downlink_chunk_limit() if self.is_server else self.uplink_chunk
+
+    def cap_code(self) -> int:
+        return 1 if self.downlink_chunk_limit() <= DNS_LEGACY_DOWNLINK_CHUNK else 0
+
+    def resegment_oversized_unacked(self, max_allowed_chunk: int):
+        """Pecah ulang segmen unacked yang melebihi limit baru setelah fallback EDNS0."""
+        oversized_seqs = [
+            s for s in sorted(self.unacked.keys()) if len(self.unacked[s][3]) > max_allowed_chunk
+        ]
+        if not oversized_seqs:
+            return
+        for seq in reversed(oversized_seqs):
+            entry = self.unacked.pop(seq)
+            _, ftype, sid, data, _ = entry
+            if sid not in self.stream_queues:
+                self.stream_queues[sid] = deque()
+            if sid in self.stream_rr:
+                try:
+                    self.stream_rr.remove(sid)
+                except ValueError:
+                    pass
+            self.stream_rr.appendleft(sid)
+            q = self.stream_queues[sid]
+            parts = [
+                data[i : i + max_allowed_chunk]
+                for i in range(0, len(data), max_allowed_chunk)
+            ]
+            for part in reversed(parts):
+                q.appendleft((ftype, part))
+
+    def apply_peer_cap_code(self, cap_code: int, token_hex: str = ""):
+        if not self.is_server:
+            return
+        new_cap = (
+            DNS_LEGACY_DOWNLINK_CHUNK if cap_code == 1 else DNS_MAX_DOWNLINK_CHUNK
+        )
+        prev_limit = self.downlink_chunk_limit()
+        self.client_chunk_cap = new_cap
+        if new_cap <= DNS_LEGACY_DOWNLINK_CHUNK:
+            self.edns_size = EDNS0_LEGACY_PAYLOAD_SIZE
+        new_limit = self.downlink_chunk_limit()
+        if new_limit < prev_limit:
+            self.resegment_oversized_unacked(new_limit)
+            if token_hex:
+                print(
+                    f"[{PROTOCOL_BANNER}] DNS-ARQ CHUNK LOCK -> Token={token_hex} "
+                    f"| Chunk={prev_limit}B->{new_limit}B"
+                )
+
+    def queued_count(self) -> int:
+        return sum(len(q) for q in self.stream_queues.values())
+
+    def has_pending_work(self) -> bool:
+        return bool(self.unacked) or any(len(q) > 0 for q in self.stream_queues.values())
+
+    def can_send_more(self) -> bool:
+        has_queued = any(len(q) > 0 for q in self.stream_queues.values())
+        return has_queued and (len(self.unacked) < self.max_inflight)
+
+    def needs_immediate_ack(self) -> bool:
+        return bool(self.rx_ooo) or (self.unacked_rx_ticks >= 2)
+
+    def min_valid_seq(self) -> int:
+        return min(self.unacked.keys()) if self.unacked else (self.tx_seq + 1)
+
+    def ack_state(self) -> Tuple[int, int]:
+        ack_seq = self.rx_next_seq - 1
+        sack_mask = 0
+        for bit in range(64):
+            if (self.rx_next_seq + 1 + bit) in self.rx_ooo:
+                sack_mask |= 1 << bit
+        return ack_seq, sack_mask
+
+    def process_peer_ack(self, ack_seq: int, sack_mask: int):
+        if ack_seq > 0:
+            for s in [s for s in self.unacked if s <= ack_seq]:
+                self.unacked.pop(s, None)
+
+        total_sacks = 0
+        if sack_mask:
+            total_sacks = bin(sack_mask).count("1")
+            for bit in range(64):
+                if (sack_mask >> bit) & 1:
+                    self.unacked.pop(ack_seq + 2 + bit, None)
+
+        # Fast Retransmit jika >= 3 segmen setelah missing_seq sudah diterima peer
+        missing_seq = ack_seq + 1
+        if missing_seq in self.unacked and total_sacks >= 3:
+            entry = self.unacked[missing_seq]
+            if entry[0] > 0.0 and entry[4] == 0:
+                entry[0] = 0.01
+
+    def purge_stream(self, stream_id: int):
+        if stream_id <= 0:
+            return
+        self.stream_queues.pop(stream_id, None)
+        for seq in [s for s, e in self.unacked.items() if e[2] == stream_id]:
+            self.unacked.pop(seq, None)
+
+    def enqueue(
+        self,
+        frame_type: int,
+        stream_id: int,
+        payload: bytes,
+        wake_event: Optional[asyncio.Event] = None,
+    ):
+        max_chunk = self.tx_chunk_limit()
+        if stream_id not in self.stream_queues:
+            self.stream_queues[stream_id] = deque()
+            self.stream_rr.append(stream_id)
+
+        q = self.stream_queues[stream_id]
+        if not payload:
+            q.append((frame_type, b""))
+            if wake_event:
+                wake_event.set()
+            return
+
+        offset = 0
+        if (
+            frame_type == TYPE_STREAM_DATA
+            and q
+            and q[-1][0] == TYPE_STREAM_DATA
+            and len(q[-1][1]) < max_chunk
+        ):
+            prev_type, prev_data = q.pop()
+            need = max_chunk - len(prev_data)
+            q.append((prev_type, prev_data + payload[:need]))
+            offset = need
+
+        while offset < len(payload):
+            q.append((frame_type, payload[offset : offset + max_chunk]))
+            offset += max_chunk
+
+        if wake_event:
+            wake_event.set()
+
+    def _pop_rr_item_fitting(self, max_data_bytes: int) -> Optional[Tuple[int, int, bytes]]:
+        if max_data_bytes < 0:
+            return None
+        checked = 0
+        total_streams = len(self.stream_rr)
+        while self.stream_rr and checked < total_streams:
+            checked += 1
+            sid = self.stream_rr.popleft()
+            q = self.stream_queues.get(sid)
+            if not q:
+                self.stream_queues.pop(sid, None)
+                continue
+            ftype, chunk = q[0]
+            if len(chunk) <= max_data_bytes:
+                q.popleft()
+                if q:
+                    self.stream_rr.append(sid)
+                else:
+                    self.stream_queues.pop(sid, None)
+                return ftype, sid, chunk
+            if max_data_bytes >= 20 and ftype == TYPE_STREAM_DATA:
+                q.popleft()
+                head = chunk[:max_data_bytes]
+                q.appendleft((ftype, chunk[max_data_bytes:]))
+                self.stream_rr.append(sid)
+                return ftype, sid, head
+            self.stream_rr.append(sid)
+        return None
+
+    def pop_next_wire(
+        self, emit_idle_poll: bool, max_arq_bytes_override: Optional[int] = None
+    ) -> Tuple[bytes, bool]:
+        now = time.monotonic()
+        ack_seq, sack_mask = self.ack_state()
+        min_valid = self.min_valid_seq()
+        ccode = self.cap_code()
+        base_rto = self.current_rto()
+
+        default_budget = self.ARQ_HDR_SIZE + self.SUB_HDR_SIZE + self.tx_chunk_limit()
+        budget = max_arq_bytes_override if max_arq_bytes_override is not None else default_budget
+
+        body_buf = bytearray()
+        segments_packed = 0
+        retx_packed = 0
+
+        # 1. Retransmisi terukur (maks 2 segmen per DNS query + exponential backoff)
+        for seq in sorted(self.unacked.keys()):
+            if retx_packed >= 2:
+                break
+            entry = self.unacked[seq]
+            eff_rto = base_rto * min(4.0, 1.45 ** entry[4])
+            if entry[0] > 0.0 and (now - entry[0]) >= eff_rto:
+                needed = self.SUB_HDR_SIZE + len(entry[3])
+                if self.ARQ_HDR_SIZE + len(body_buf) + needed <= budget:
+                    entry[0] = now
+                    entry[4] += 1
+                    self.retransmit_count += 1
+                    body_buf.extend(
+                        struct.pack(
+                            self.SUB_HDR_STRUCT, seq, entry[1], entry[2], len(entry[3])
+                        )
+                    )
+                    body_buf.extend(entry[3])
+                    segments_packed += 1
+                    retx_packed += 1
+
+        # 2. Isi sisa ruang paket DNS dengan segmen baru dari antrean round-robin
+        while len(self.unacked) < self.max_inflight:
+            rem_data_space = budget - (
+                self.ARQ_HDR_SIZE + len(body_buf) + self.SUB_HDR_SIZE
+            )
+            if rem_data_space < 0:
+                break
+            item = self._pop_rr_item_fitting(rem_data_space)
+            if item is None:
+                break
+            ftype, sid, chunk = item
+            self.tx_seq += 1
+            seq = self.tx_seq
+            self.unacked[seq] = [now, ftype, sid, chunk, 0]
+            body_buf.extend(
+                struct.pack(self.SUB_HDR_STRUCT, seq, ftype, sid, len(chunk))
+            )
+            body_buf.extend(chunk)
+            segments_packed += 1
+
+        if segments_packed > 1:
+            self.coalesced_packets += 1
+
+        if segments_packed > 0:
+            self.unacked_rx_ticks = 0
+            min_valid = self.min_valid_seq()
+            arq_hdr = struct.pack(
+                self.ARQ_HDR_STRUCT, ack_seq, sack_mask, min_valid, ccode
+            )
+            wire_pkt, _, _ = self.crypto.encode_frame(
+                TYPE_DNS_BATCH,
+                0,
+                arq_hdr + bytes(body_buf),
+                flags=FLAG_DNS_CARRIER,
+                min_pad=1,
+                max_pad=1,
+            )
+            return wire_pkt, (True if not self.is_server else self.can_send_more())
+
+        # 3. Kirim ACK/Poll kosong jika diperlukan
+        if (
+            emit_idle_poll
+            or ack_seq > 0
+            or sack_mask > 0
+            or self.has_pending_work()
+            or min_valid > 1
+        ):
+            self.unacked_rx_ticks = 0
+            arq_hdr = struct.pack(
+                self.ARQ_HDR_STRUCT, ack_seq, sack_mask, min_valid, ccode
+            )
+            wire_pkt, _, _ = self.crypto.encode_frame(
+                TYPE_DNS_POLL,
+                0,
+                arq_hdr,
+                flags=FLAG_DNS_CARRIER,
+                min_pad=1,
+                max_pad=1,
+            )
+            return wire_pkt, (False if not self.is_server else self.can_send_more())
+
+        return b"", False
+
+    def peek_ack_header(self, payload: bytes) -> Optional[Tuple[int, int, int, int]]:
+        if len(payload) < self.ARQ_HDR_SIZE:
+            return None
+        return struct.unpack(self.ARQ_HDR_STRUCT, payload[: self.ARQ_HDR_SIZE])
+
+    async def ingest_incoming(
+        self,
+        payload: bytes,
+        deliver_cb: Callable[[int, int, bytes], Awaitable[None]],
+        token_hex: str = "",
+    ):
+        if len(payload) < self.ARQ_HDR_SIZE:
+            return
+        async with self.rx_lock:
+            peer_ack, peer_sack_mask, peer_min_valid, peer_cap = struct.unpack(
+                self.ARQ_HDR_STRUCT, payload[: self.ARQ_HDR_SIZE]
+            )
+            self.apply_peer_cap_code(peer_cap, token_hex)
+            self.process_peer_ack(peer_ack, peer_sack_mask)
+
+            if peer_min_valid > self.rx_next_seq:
+                for s in [s for s in self.rx_ooo if s < peer_min_valid]:
+                    self.rx_ooo.pop(s, None)
+                self.rx_next_seq = peer_min_valid
+                while self.rx_next_seq in self.rx_ooo:
+                    o_type, o_sid, o_data = self.rx_ooo.pop(self.rx_next_seq)
+                    self.rx_next_seq += 1
+                    if o_type != TYPE_DNS_POLL:
+                        await deliver_cb(o_type, o_sid, o_data)
+
+            pos = self.ARQ_HDR_SIZE
+            received_any_data = False
+            while pos + self.SUB_HDR_SIZE <= len(payload):
+                dns_seq, ftype, stream_id, dlen = struct.unpack(
+                    self.SUB_HDR_STRUCT, payload[pos : pos + self.SUB_HDR_SIZE]
+                )
+                pos += self.SUB_HDR_SIZE
+                if pos + dlen > len(payload):
+                    break
+                raw_data = payload[pos : pos + dlen]
+                pos += dlen
+
+                if dns_seq == 0 or dns_seq < self.rx_next_seq:
+                    received_any_data = True
+                    continue
+
+                received_any_data = True
+                self.rx_ooo[dns_seq] = (ftype, stream_id, raw_data)
+
+            if received_any_data:
+                self.unacked_rx_ticks += 1
+
+            while self.rx_next_seq in self.rx_ooo:
+                o_type, o_sid, o_data = self.rx_ooo.pop(self.rx_next_seq)
+                self.rx_next_seq += 1
+                if o_type != TYPE_DNS_POLL:
+                    await deliver_cb(o_type, o_sid, o_data)

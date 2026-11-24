@@ -1,0 +1,37 @@
+[AWP-v4.6 SERVER] Aktif pada 0.0.0.0 Ports=[443, 5353, 2053, 4500] [TLS1.3-TCP + WS-HTTP + QUIC-UDP] & UDP:53 [DNS-JUMPER TLP SACK | Zone=ns2.mnas.store | Verbose=ON]
+[AWP-v4.6] DNS-JUMPER SPA NEW | Token=ab13df645e1f0977 | Resolver=('114.5.148.34', 53823) | QTYPE=16 | EDNS0=1232B
+[AWP-v4.6] DNS-ARQ CHUNK LOCK -> Token=ab13df645e1f0977 | Chunk=640B->175B
+[08:17:26.919][VERBOSE][SRV] [ab13df64] DNS tx=32865 res=114.5.148.34 in_type=0x07 in_len=17B ack=0 sack=0x0 cap=1 -> out_wire=101B udp_len=293B more=1 q=0 unacked=1 rto=0.47s
+[08:17:27.016][VERBOSE][SRV] [ab13df64] DNS tx=20960 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.041][VERBOSE][SRV] [ab13df64] DNS tx=26095 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.111][VERBOSE][SRV] [ab13df64] DNS tx=50207 res=172.253.211.82 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.129][VERBOSE][SRV] [ab13df64] DNS tx=58990 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.193][VERBOSE][SRV] [ab13df64] DNS tx=1788 res=172.217.44.217 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.242][VERBOSE][SRV] [ab13df64] DNS tx=1597 res=74.114.31.152 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.317][VERBOSE][SRV] [ab13df64] DNS tx=29517 res=172.253.84.211 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.333][VERBOSE][SRV] [ab13df64] DNS tx=6518 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.382][VERBOSE][SRV] [ab13df64] DNS tx=49612 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.455][VERBOSE][SRV] [ab13df64] DNS tx=4867 res=172.217.43.152 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.497][VERBOSE][SRV] [ab13df64] DNS tx=25007 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.535][VERBOSE][SRV] [ab13df64] DNS tx=8286 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.579][VERBOSE][SRV] [ab13df64] DNS tx=28949 res=172.253.84.220 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.582][VERBOSE][SRV] [ab13df64] DNS tx=51715 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.601][VERBOSE][SRV] [ab13df64] DNS tx=40459 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.643][VERBOSE][SRV] [ab13df64] DNS tx=16412 res=172.217.44.218 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.694][VERBOSE][SRV] [ab13df64] DNS tx=39042 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.751][VERBOSE][SRV] [ab13df64] DNS tx=64827 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.762][VERBOSE][SRV] [ab13df64] DNS tx=36815 res=172.253.211.88 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.787][VERBOSE][SRV] [ab13df64] DNS tx=48900 res=172.217.43.158 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.805][VERBOSE][SRV] [ab13df64] DNS tx=14099 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.829][VERBOSE][SRV] [ab13df64] DNS tx=54693 res=172.253.236.219 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.859][VERBOSE][SRV] [ab13df64] DNS tx=34769 res=172.217.47.18 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.889][VERBOSE][SRV] [ab13df64] DNS tx=54370 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.925][VERBOSE][SRV] [ab13df64] DNS tx=6320 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.945][VERBOSE][SRV] [ab13df64] DNS tx=58115 res=74.114.28.16 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:27.973][VERBOSE][SRV] [ab13df64] DNS tx=20631 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:28.007][VERBOSE][SRV] [ab13df64] DNS tx=52375 res=172.253.211.85 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:28.033][VERBOSE][SRV] [ab13df64] DNS tx=34352 res=172.217.32.145 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:28.095][VERBOSE][SRV] [ab13df64] DNS tx=30814 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:28.096][VERBOSE][SRV] [ab13df64] DNS tx=46496 res=172.253.84.221 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:28.111][VERBOSE][SRV] [ab13df64] DNS tx=56163 res=192.178.38.151 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
+[08:17:28.141][VERBOSE][SRV] [ab13df64] DNS tx=6525 res=114.5.148.34 in_type=0x07 in_len=17B ack=1 sack=0x0 cap=1 -> out_wire=66B udp_len=245B more=0 q=0 unacked=0 rto=0.46s
